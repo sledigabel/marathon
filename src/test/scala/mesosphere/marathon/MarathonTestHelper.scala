@@ -1,17 +1,22 @@
 package mesosphere.marathon
 
+import java.util.UUID
+
+import com.codahale.metrics.MetricRegistry
 import com.github.fge.jackson.JsonLoader
 import com.github.fge.jsonschema.core.report.ProcessingReport
 import com.github.fge.jsonschema.main.JsonSchemaFactory
 import mesosphere.marathon.Protos.MarathonTask
 import mesosphere.marathon.api.JsonTestHelper
 import mesosphere.marathon.api.v2.json.V2AppDefinition
-
-import mesosphere.marathon.state.{ Timestamp, AppDefinition }
+import mesosphere.marathon.metrics.Metrics
 import mesosphere.marathon.state.PathId._
-import mesosphere.marathon.tasks.MarathonTasks
+import mesosphere.marathon.state.{ AppDefinition, MarathonProtoStore, MarathonTaskConverter, Timestamp }
+import mesosphere.marathon.tasks.{ MarathonTasks, TaskTracker }
 import mesosphere.mesos.protos._
-import org.apache.mesos.Protos.{ CommandInfo, TaskID, TaskInfo, Offer }
+import mesosphere.util.state.PersistentStore
+import mesosphere.util.state.memory.InMemoryStore
+import org.apache.mesos.Protos.{ CommandInfo, Offer, TaskID, TaskInfo }
 import org.rogach.scallop.ScallopConf
 import play.api.libs.json.Json
 
@@ -124,9 +129,9 @@ trait MarathonTestHelper {
 
   def makeBasicApp() = AppDefinition(
     id = "test-app".toPath,
-    cpus = 1,
-    mem = 64,
-    disk = 1,
+    cpus = 1.0,
+    mem = 64.0,
+    disk = 1.0,
     executor = "//cmd"
   )
 
@@ -151,6 +156,23 @@ trait MarathonTestHelper {
     lazy val pretty = Json.prettyPrint(Json.parse(appStr))
     assert(validationResult.isSuccess == valid, s"validation errors $validationResult for json:\n$pretty")
   }
+
+  def createTaskTracker(
+    store: PersistentStore = new InMemoryStore,
+    config: MarathonConf = defaultConfig(),
+    metrics: Metrics = new Metrics(new MetricRegistry)): TaskTracker = {
+
+    val metrics = new Metrics(new MetricRegistry)
+    val protoStore = new MarathonProtoStore[MarathonTask, MarathonTask, MarathonTaskConverter](
+      store = store,
+      converter = new MarathonTaskConverter,
+      metrics = metrics,
+      newState = () => MarathonTask.newBuilder().setId("task_a").build(),
+      prefix = TaskTracker.STORE_PREFIX)
+    new TaskTracker(protoStore, defaultConfig(), metrics)
+  }
+
+  def dummyTask() = MarathonTask.newBuilder().setId(UUID.randomUUID().toString).build()
 }
 
 object MarathonTestHelper extends MarathonTestHelper
