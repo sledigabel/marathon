@@ -1,16 +1,16 @@
 package mesosphere.marathon.state
 
 import com.codahale.metrics.MetricRegistry
-import mesosphere.marathon.MarathonConf
 import mesosphere.marathon.metrics.Metrics
 import mesosphere.marathon.state.StorageVersions._
+import mesosphere.marathon.{ MarathonConf, MarathonSpec, MarathonTestHelper }
 import mesosphere.util.Mockito
 import mesosphere.util.state.{ PersistentEntity, PersistentStore, PersistentStoreManagement }
-import org.scalatest.{ FunSuite, Matchers }
+import org.scalatest.Matchers
 
 import scala.concurrent.Future
 
-class MigrationTest extends FunSuite with Mockito with Matchers {
+class MigrationTest extends MarathonSpec with Mockito with Matchers {
 
   test("migrations can be filtered by version") {
     val all = migration.migrations.filter(_._1 > StorageVersions(0, 0, 0)).sortBy(_._1)
@@ -25,6 +25,7 @@ class MigrationTest extends FunSuite with Mockito with Matchers {
 
   test("migration calls initialization") {
     trait StoreWithManagement extends PersistentStore with PersistentStoreManagement
+    val taskTracker = MarathonTestHelper.createTaskTracker()
     val store = mock[StoreWithManagement]
     val appRepo = mock[AppRepository]
     val groupRepo = mock[GroupRepository]
@@ -38,17 +39,18 @@ class MigrationTest extends FunSuite with Mockito with Matchers {
     appRepo.apps() returns Future.successful(Seq.empty)
     appRepo.allPathIds() returns Future.successful(Seq.empty)
     groupRepo.group("root") returns Future.successful(None)
-    val migrate = new Migration(store, appRepo, groupRepo, config, new Metrics(new MetricRegistry))
+    val migrate = new Migration(store, appRepo, groupRepo, taskTracker, config, new Metrics(new MetricRegistry))
 
     migrate.migrate()
     verify(store, atLeastOnce).initialize()
   }
 
   def migration = {
+    val taskTracker = MarathonTestHelper.createTaskTracker()
     val state = mock[PersistentStore]
     val appRepo = mock[AppRepository]
     val groupRepo = mock[GroupRepository]
     val config = mock[MarathonConf]
-    new Migration(state, appRepo, groupRepo, config, new Metrics(new MetricRegistry))
+    new Migration(state, appRepo, groupRepo, taskTracker, config, new Metrics(new MetricRegistry))
   }
 }

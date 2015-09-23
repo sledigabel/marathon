@@ -1,45 +1,47 @@
 package mesosphere.marathon.tasks
 
-import java.io._
 import javax.inject.Inject
 
 import mesosphere.marathon.MarathonConf
 import mesosphere.marathon.Protos._
 import mesosphere.marathon.metrics.Metrics
-import mesosphere.marathon.state.{ PathId, StateMetrics, Timestamp }
-import mesosphere.util.state.{ PersistentEntity, PersistentStore }
+import mesosphere.marathon.state.{ EntityStore, MarathonTaskState, PathId, StateMetrics, Timestamp }
 import org.apache.mesos.Protos.{ TaskState, TaskStatus }
 import org.slf4j.LoggerFactory
 
-import scala.collection.JavaConverters._
 import scala.collection._
 import scala.collection.concurrent.TrieMap
 import scala.collection.immutable.Set
 import scala.concurrent.{ Await, Future }
 
 class TaskTracker @Inject() (
-    store: PersistentStore,
+    store: EntityStore[MarathonTaskState],
     config: MarathonConf,
     val metrics: Metrics) extends StateMetrics {
 
   import mesosphere.marathon.tasks.TaskTracker._
   import mesosphere.util.ThreadPoolContext.context
 
+  import scala.language.implicitConversions
+
   implicit val timeout = config.zkTimeoutDuration
 
   private[this] val log = LoggerFactory.getLogger(getClass.getName)
 
-  val PREFIX = "task:"
   val ID_DELIMITER = ":"
 
   private[tasks] val apps = TrieMap[PathId, InternalApp]()
 
-  private[tasks] def fetchFromState(id: String): Option[PersistentEntity] = timedRead {
-    Await.result(store.load(id), timeout)
+  private[tasks] def fetchFromState(id: String): Option[MarathonTask] = timedRead {
+    val res = store.fetch(id).flatMap {
+      case Some(taskState) => Future.successful(Some(taskState.toProto))
+      case _               => Future.successful(None)
+    }
+    Await.result(res, timeout)
   }
 
   private[tasks] def getKey(appId: PathId, taskId: String): String = {
-    PREFIX + appId.safePath + ID_DELIMITER + taskId
+    appId.safePath + ID_DELIMITER + taskId
   }
 
   def get(appId: PathId): Set[MarathonTask] =
@@ -105,7 +107,7 @@ class TaskTracker @Inject() (
         app.tasks.remove(task.getId)
 
         timedWrite {
-          Await.result(store.delete(getKey(appId, taskId)), timeout)
+          Await.result(store.expunge(getKey(appId, taskId)), timeout)
         }
 
         log.info(s"Task $taskId expunged and removed from TaskTracker")
@@ -195,7 +197,7 @@ class TaskTracker @Inject() (
     // Remove tasks that don't have any tasks associated with them. Expensive!
     log.info("Expunging orphaned tasks from store")
     val stateTaskKeys = timedRead {
-      Await.result(store.allIds(), timeout).filter(_.startsWith(PREFIX))
+      Await.result(store.names(), timeout)
     }
     val appsTaskKeys = apps.values.flatMap { app =>
       app.tasks.keys.map(taskId => getKey(app.appName, taskId))
@@ -205,7 +207,7 @@ class TaskTracker @Inject() (
       if (!appsTaskKeys.contains(stateTaskKey)) {
         log.info(s"Expunging orphaned task with key $stateTaskKey")
         timedWrite {
-          Await.result(store.delete(stateTaskKey), timeout)
+          Await.result(store.expunge(stateTaskKey), timeout)
         }
       }
     }
@@ -214,10 +216,10 @@ class TaskTracker @Inject() (
   private[tasks] def fetchApp(appId: PathId): InternalApp = {
     log.debug(s"Fetching app from store $appId")
     val names = timedRead {
-      Await.result(store.allIds(), timeout).toSet
+      Await.result(store.names(), timeout).toSet
     }
     val tasks = TrieMap[String, MarathonTask]()
-    val taskKeys = names.filter(name => name.startsWith(PREFIX + appId.safePath + ID_DELIMITER))
+    val taskKeys = names.filter(name => name.startsWith(appId.safePath + ID_DELIMITER))
     for {
       taskKey <- taskKeys
       task <- fetchTask(taskKey)
@@ -230,74 +232,12 @@ class TaskTracker @Inject() (
     fetchTask(getKey(appId, taskId))
 
   private[tasks] def fetchTask(taskKey: String): Option[MarathonTask] = {
-    fetchFromState(taskKey).flatMap { entity =>
-      val source = new ObjectInputStream(new ByteArrayInputStream(entity.bytes.toArray))
-      deserialize(taskKey, source)
-    }
+    fetchFromState(taskKey)
   }
 
-  def deserialize(taskKey: String, source: ObjectInputStream): Option[MarathonTask] = {
-    if (source.available > 0) {
-      try {
-        val size = source.readInt
-        val bytes = new Array[Byte](size)
-        source.readFully(bytes)
-        Some(MarathonTask.parseFrom(bytes))
-      }
-      catch {
-        case e: com.google.protobuf.InvalidProtocolBufferException =>
-          log.warn(s"Unable to deserialize task state for $taskKey", e)
-          None
-      }
-    }
-    else {
-      log.warn(s"Unable to deserialize task state for $taskKey")
-      None
-    }
-  }
-
-  def legacyDeserialize(appId: PathId, source: ObjectInputStream): TrieMap[String, MarathonTask] = {
-    var results = TrieMap[String, MarathonTask]()
-
-    if (source.available > 0) {
-      try {
-        val size = source.readInt
-        val bytes = new Array[Byte](size)
-        source.readFully(bytes)
-        val app = MarathonApp.parseFrom(bytes)
-        if (app.getName != appId.toString) {
-          log.warn(s"App name from task state for $appId is wrong!  Got '${app.getName}' Continuing anyway...")
-        }
-        results ++= app.getTasksList.asScala.map(x => x.getId -> x)
-      }
-      catch {
-        case e: com.google.protobuf.InvalidProtocolBufferException =>
-          log.warn(s"Unable to deserialize task state for $appId", e)
-      }
-    }
-    else {
-      log.warn(s"Unable to deserialize task state for $appId")
-    }
-    results
-  }
-
-  def serialize(task: MarathonTask, sink: ObjectOutputStream): Unit = {
-    val size = task.getSerializedSize
-    sink.writeInt(size)
-    sink.write(task.toByteArray)
-    sink.flush()
-  }
-
-  def store(appId: PathId, task: MarathonTask): Future[PersistentEntity] = {
-    val byteStream = new ByteArrayOutputStream()
-    val output = new ObjectOutputStream(byteStream)
-    serialize(task, output)
-    val bytes = byteStream.toByteArray
+  def store(appId: PathId, task: MarathonTask): Future[MarathonTask] = {
     val key: String = getKey(appId, task.getId)
-    timedWrite(fetchFromState(key) match {
-      case Some(entity) => store.update(entity.withNewContent(bytes))
-      case None         => store.create(key, bytes)
-    })
+    store.store(key, MarathonTaskState(task)).map(_.toProto)
   }
 
   /**
@@ -314,6 +254,8 @@ class TaskTracker @Inject() (
 }
 
 object TaskTracker {
+
+  val STORE_PREFIX = "task:"
 
   private[marathon] class InternalApp(
       val appName: PathId,

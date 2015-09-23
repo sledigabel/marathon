@@ -16,6 +16,7 @@ import com.twitter.common.base.Supplier
 import com.twitter.common.zookeeper.{ Candidate, CandidateImpl, Group => ZGroup, ZooKeeperClient }
 import com.twitter.zk.{ NativeConnector, ZkClient }
 import mesosphere.chaos.http.HttpConf
+import mesosphere.marathon.Protos.MarathonTask
 import mesosphere.marathon.api.LeaderInfo
 import mesosphere.marathon.core.launchqueue.LaunchQueue
 import mesosphere.marathon.event.http.{
@@ -78,7 +79,6 @@ class MarathonModule(conf: MarathonConf, http: HttpConf, zk: ZooKeeperClient)
     bind(classOf[MarathonScheduler]).in(Scopes.SINGLETON)
     bind(classOf[MarathonSchedulerService]).in(Scopes.SINGLETON)
     bind(classOf[LeaderInfo]).to(classOf[MarathonLeaderInfo]).in(Scopes.SINGLETON)
-    bind(classOf[TaskTracker]).in(Scopes.SINGLETON)
     bind(classOf[TaskFactory]).to(classOf[DefaultTaskFactory]).in(Scopes.SINGLETON)
 
     bind(classOf[HealthCheckManager]).to(classOf[MarathonHealthCheckManager]).asEagerSingleton()
@@ -326,13 +326,26 @@ class MarathonModule(conf: MarathonConf, http: HttpConf, zk: ZooKeeperClient)
 
   @Provides
   @Singleton
+  def provideTaskTracker(store: PersistentStore, metrics: Metrics, conf: MarathonConf): TaskTracker = {
+    new TaskTracker(
+      new MarathonStore[MarathonTaskState](
+        store = store,
+        metrics = metrics,
+        newState = () => MarathonTaskState(MarathonTask.newBuilder().setId(UUID.randomUUID().toString).build()),
+        prefix = TaskTracker.STORE_PREFIX),
+      conf, metrics
+    )
+  }
+  @Provides
+  @Singleton
   def provideMigration(
     store: PersistentStore,
     appRepo: AppRepository,
     groupRepo: GroupRepository,
+    taskTracker: TaskTracker,
     metrics: Metrics,
     config: MarathonConf): Migration = {
-    new Migration(store, appRepo, groupRepo, config, metrics)
+    new Migration(store, appRepo, groupRepo, taskTracker, config, metrics)
   }
 
   @Provides

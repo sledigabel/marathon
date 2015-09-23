@@ -3,7 +3,7 @@ package mesosphere.marathon.state
 import java.io.{ ByteArrayInputStream, ObjectInputStream }
 import javax.inject.Inject
 
-import mesosphere.marathon.Protos.StorageVersion
+import mesosphere.marathon.Protos.{ MarathonApp, MarathonTask, StorageVersion }
 import mesosphere.marathon.metrics.Metrics
 import mesosphere.marathon.state.PathId._
 import mesosphere.marathon.state.StorageVersions._
@@ -12,11 +12,13 @@ import mesosphere.marathon.tasks.TaskTracker.InternalApp
 import mesosphere.marathon.{ BuildInfo, MarathonConf }
 import mesosphere.util.Logging
 import mesosphere.util.ThreadPoolContext.context
-import mesosphere.util.state.{ PersistentStoreManagement, PersistentEntity, PersistentStore }
+import mesosphere.util.state.{ PersistentStore, PersistentStoreManagement }
+import org.apache.log4j.Logger
 import org.slf4j.LoggerFactory
 
 import scala.collection.JavaConverters._
 import scala.collection.SortedSet
+import scala.collection.concurrent.TrieMap
 import scala.concurrent.duration._
 import scala.concurrent.{ Await, Future }
 import scala.util.control.NonFatal
@@ -26,6 +28,7 @@ class Migration @Inject() (
     store: PersistentStore,
     appRepo: AppRepository,
     groupRepo: GroupRepository,
+    taskTracker: TaskTracker,
     config: MarathonConf,
     metrics: Metrics) extends Logging {
 
@@ -116,11 +119,11 @@ class Migration @Inject() (
   }
 
   private def changeTasks(fn: InternalApp => InternalApp): Future[Any] = {
-    val taskTracker = new TaskTracker(store, config, metrics)
+    val LEGACY_PREFIX = "tasks:"
     def fetchApp(appId: PathId): Option[InternalApp] = {
-      Await.result(store.load("tasks:" + appId.safePath), config.zkTimeoutDuration).map { entity =>
+      Await.result(store.load(LEGACY_PREFIX + appId.safePath), config.zkTimeoutDuration).map { entity =>
         val source = new ObjectInputStream(new ByteArrayInputStream(entity.bytes.toArray))
-        val fetchedTasks = taskTracker.legacyDeserialize(appId, source).map {
+        val fetchedTasks = LegacyTaskMigrationHelper.legacyDeserialize(appId, source).map {
           case (key, task) =>
             val builder = task.toBuilder.clearOBSOLETEStatuses()
             task.getOBSOLETEStatusesList.asScala.lastOption.foreach(builder.setStatus)
@@ -129,7 +132,7 @@ class Migration @Inject() (
         new InternalApp(appId, fetchedTasks, false)
       }
     }
-    def storeApp(app: InternalApp): Future[Seq[PersistentEntity]] = {
+    def storeApp(app: InternalApp): Future[Seq[MarathonTask]] = {
       Future.sequence(app.tasks.values.toSeq.map(taskTracker.store(app.appName, _)))
     }
     appRepo.allPathIds().flatMap { apps =>
@@ -149,6 +152,38 @@ class Migration @Inject() (
       }
     }
   }
+}
+
+object LegacyTaskMigrationHelper {
+
+  private[this] val log = Logger.getLogger(getClass.getName)
+
+  // TODO is this still needed? it was introduced in 4c1c5d994aa303a90d54985efb8490e6cc69dd65 on 08/07/2014 ...
+  def legacyDeserialize(appId: PathId, source: ObjectInputStream): TrieMap[String, MarathonTask] = {
+    val results = TrieMap[String, MarathonTask]()
+
+    if (source.available > 0) {
+      try {
+        val size = source.readInt
+        val bytes = new Array[Byte](size)
+        source.readFully(bytes)
+        val app = MarathonApp.parseFrom(bytes)
+        if (app.getName != appId.toString) {
+          log.warn(s"App name from task state for $appId is wrong!  Got '${app.getName}' Continuing anyway...")
+        }
+        results ++= app.getTasksList.asScala.map(x => x.getId -> x)
+      }
+      catch {
+        case e: com.google.protobuf.InvalidProtocolBufferException =>
+          log.warn(s"Unable to deserialize task state for $appId", e)
+      }
+    }
+    else {
+      log.warn(s"Unable to deserialize task state for $appId")
+    }
+    results
+  }
+
 }
 
 /**

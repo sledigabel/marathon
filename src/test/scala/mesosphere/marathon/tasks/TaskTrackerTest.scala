@@ -4,6 +4,7 @@ import java.io.{ ByteArrayInputStream, ByteArrayOutputStream, ObjectInputStream,
 
 import com.codahale.metrics.MetricRegistry
 import com.google.common.collect.Lists
+import mesosphere.FutureTestSupport._
 import mesosphere.marathon.MarathonSpec
 import mesosphere.marathon.Protos.MarathonTask
 import mesosphere.marathon.core.base.ConstantClock
@@ -18,9 +19,8 @@ import org.apache.mesos.Protos
 import org.apache.mesos.Protos.{ TaskID, TaskState, TaskStatus }
 import org.mockito.Matchers.any
 import org.mockito.Mockito.{ reset, spy, times, verify }
-import org.scalatest.{ GivenWhenThen, Matchers }
 import org.scalatest.concurrent.ScalaFutures
-import mesosphere.FutureTestSupport._
+import org.scalatest.{ GivenWhenThen, Matchers }
 
 import scala.collection._
 import scala.concurrent.duration._
@@ -37,7 +37,7 @@ class TaskTrackerTest extends MarathonSpec with Matchers with GivenWhenThen {
 
   before {
     state = spy(new InMemoryStore)
-    taskTracker = new TaskTracker(state, config, metrics)
+    taskTracker = createTaskTracker(state, config, metrics)
   }
 
   def makeSampleTask(id: String) = {
@@ -78,11 +78,13 @@ class TaskTrackerTest extends MarathonSpec with Matchers with GivenWhenThen {
   }
 
   def stateShouldNotContainKey(state: PersistentStore, key: String) {
-    assert(!state.allIds().futureValue.toSet.contains(key), s"Key $key was found in state")
+    val keyWithPrefix = TaskTracker.STORE_PREFIX + key
+    assert(!state.allIds().futureValue.toSet.contains(keyWithPrefix), s"Key $keyWithPrefix was found in state")
   }
 
   def stateShouldContainKey(state: PersistentStore, key: String) {
-    assert(state.allIds().futureValue.toSet.contains(key), s"Key $key was not found in state")
+    val keyWithPrefix = TaskTracker.STORE_PREFIX + key
+    assert(state.allIds().futureValue.toSet.contains(keyWithPrefix), s"Key $keyWithPrefix was not found in state")
   }
 
   test("SerializeAndDeserialize") {
@@ -90,12 +92,12 @@ class TaskTrackerTest extends MarathonSpec with Matchers with GivenWhenThen {
     val byteOutputStream = new ByteArrayOutputStream()
     val outputStream = new ObjectOutputStream(byteOutputStream)
 
-    taskTracker.serialize(sampleTask, outputStream)
+    taskTracker.store(TEST_APP_NAME, sampleTask)
 
     val byteInputStream = new ByteArrayInputStream(byteOutputStream.toByteArray)
     val inputStream = new ObjectInputStream(byteInputStream)
 
-    val deserializedTask = taskTracker.deserialize(taskTracker.getKey(TEST_APP_NAME, TEST_TASK_ID), inputStream)
+    val deserializedTask = taskTracker.fetchTask(TEST_APP_NAME, TEST_TASK_ID)
 
     assert(deserializedTask.get.equals(sampleTask), "Tasks are not properly serialized")
   }
